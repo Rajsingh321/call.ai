@@ -1,182 +1,295 @@
-from flask import Flask, request, Response
+# app.py
+from flask import Flask, request, Response, jsonify, send_file, url_for
 from twilio.twiml.voice_response import VoiceResponse, Dial
 import requests
 import speech_recognition as sr
 import os
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
-from groq import Groq
+from groq import Groq  # keep if you have groq; fallback will use keywords
 
 load_dotenv()
+
 app = Flask(__name__)
 
 # === ENV VARIABLES ===
-LLM_API_KEY = os.getenv("LLM_API_KEY")       
-TWILIO_AUTH = os.getenv("TWILIO_AUTH_TOKEN")
-TWILIO_FROM = os.getenv("TWILIO_NUMBER")     # Your AI number
-
-STATE_FILE = "call_state.json"
+LLM_API_KEY = os.getenv("LLM_API_KEY")    # optional: Groq key
+STATE_FILE = "state.json"
+AUDIO_DIR = "/mnt/data"  # used for test audio files (adjust if needed)
 
 
-# -----------------------------
-# Helper: Read Mode State
-# -----------------------------
+# ===========================
+# UTILS
+# ===========================
 def load_state():
     if not os.path.exists(STATE_FILE):
-        return {
+        default = {
             "mode": "normal",
+            "reason": "",
             "active": False,
-            "expires": "",
-            "user_number": "",
-            "custom_reason": ""
+            "expires": None,
+            "user_number": None,
         }
+        save_state(default)
+        return default
     with open(STATE_FILE, "r") as f:
         return json.load(f)
 
 
-# -----------------------------
-# Helper: Urgency Detection
-# -----------------------------
-def detect_urgent(text):
-    keywords = ["urgent", "important", "emergency", "help", "immediately", "asap"]
-    if any(k in text.lower() for k in keywords):
-        return True
+def save_state(state):
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f)
 
-    # AI-based urgent detection (optional)
-    client = Groq(api_key=LLM_API_KEY)
-    prompt = f"""
-        Caller message: "{text}"
-        Decide if this is urgent. Answer strictly YES or NO.
+
+def is_mode_active():
+    state = load_state()
+    if not state.get("active"):
+        return False
+
+    expires = state.get("expires")
+    if not expires:
+        return False
+
+    try:
+        expire_time = datetime.fromisoformat(expires)
+    except Exception:
+        # invalid format — clear mode
+        state["active"] = False
+        save_state(state)
+        return False
+
+    if datetime.utcnow() > expire_time:
+        # mode expired
+        state["active"] = False
+        state["expires"] = None
+        save_state(state)
+        return False
+
+    return True
+
+
+# ===========================
+# APP (MOBILE) CONTROL ENDPOINTS
+# ===========================
+@app.route("/set-mode", methods=["POST"])
+def set_mode():
     """
-    res = client.chat.completions.create(
-        model="llama3-8b-8192",
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=5
-    )
-    out = res.choices[0].message["content"].strip().upper()
-    return "YES" in out
+    JSON body:
+    {
+      "mode": "sleep" | "meeting" | "driving" | "custom",
+      "reason": "optional string",
+      "duration": minutes (int),
+      "user_number": "+91..."
+    }
+    """
+    data = request.get_json(force=True)
+    mode = data.get("mode", "normal")
+    reason = data.get("reason", "")
+    try:
+        duration = int(data.get("duration", 5))
+        if duration < 1:
+            duration = 1
+        if duration > 60:
+            duration = 60
+    except:
+        duration = 5
+    user_number = data.get("user_number")
+
+    state = {
+        "mode": mode,
+        "reason": reason,
+        "active": True,
+        "expires": (datetime.utcnow() + timedelta(minutes=duration)).isoformat(),
+        "user_number": user_number
+    }
+    save_state(state)
+    return jsonify({"status": "ok", "state": state})
 
 
-# -----------------------------
-# 1) INCOMING CALL HANDLER
-# -----------------------------
+@app.route("/clear-mode", methods=["POST"])
+def clear_mode():
+    state = load_state()
+    state["active"] = False
+    state["mode"] = "normal"
+    state["reason"] = ""
+    state["expires"] = None
+    save_state(state)
+    return jsonify({"status": "ok", "state": state})
+
+
+@app.route("/status", methods=["GET"])
+def status():
+    state = load_state()
+    # refresh active flag based on time
+    state["active"] = is_mode_active()
+    save_state(state)
+    return jsonify(state)
+
+
+# =================================================
+# TEST AUDIO SERVING & PLAY TWIML (for desktop testing)
+# =================================================
+@app.route("/audio/<name>", methods=["GET"])
+def serve_audio(name):
+    # serve an audio file from AUDIO_DIR, e.g. /mnt/data/test_caller_urgent.wav
+    safe_path = os.path.join(AUDIO_DIR, name)
+    if not os.path.isfile(safe_path):
+        return ("Audio not found: " + safe_path, 404)
+    return send_file(safe_path, mimetype="audio/wav")
+
+
+@app.route("/play-audio", methods=["GET", "POST"])
+def play_audio_twiML():
+    """
+    Twilio will request this TwiML when making an outbound test call.
+    Provide query param ?file=test_caller_urgent.wav
+    """
+    filename = request.args.get("file", "test_caller_urgent.wav")
+    public_audio_url = url_for("serve_audio", name=filename, _external=True)
+
+    resp = VoiceResponse()
+    resp.play(public_audio_url)
+    resp.hangup()
+    return Response(str(resp), mimetype="text/xml")
+
+
+# =================================================
+# INCOMING CALL HANDLER
+# =================================================
 @app.route("/incoming-call", methods=["POST"])
 def incoming_call():
-    state = load_state()
-
-    # If mode expired → deactivate
-    if state["active"]:
-        if datetime.utcnow() > datetime.fromisoformat(state["expires"]):
-            state["active"] = False
-            with open(STATE_FILE, "w") as f:
-                json.dump(state, f)
-
+    """
+    Twilio will POST here on inbound call.
+    If mode active: custom greeting about mode.
+    Then record and send to /process-recording.
+    """
     response = VoiceResponse()
 
-    # Greeting based on mode
-    if state["active"]:
-        mode = state["mode"]
-
-        if mode == "sleep":
-            response.say("User is sleeping right now. Please speak after the beep.")
-        elif mode == "meeting":
-            response.say("User is in a meeting. Please speak after the beep.")
-        elif mode == "driving":
-            response.say("User is driving. Please speak after the beep.")
-        elif mode == "custom":
-            response.say(f"{state['custom_reason']}. Please speak after the beep.")
+    if is_mode_active():
+        state = load_state()
+        mode = state.get("mode", "unavailable")
+        msg = f"The user is currently in {mode} mode. Please speak after the beep."
     else:
-        response.say("User is unavailable right now. Please speak after the beep.")
+        msg = "Hello! I am your AI assistant. Please speak after the beep."
 
-    # Record caller
-    response.record(
-        action="/process-recording",
-        method="POST",
-        play_beep=True
-    )
-
+    response.say(msg)
+    response.record(action="/process-recording", method="POST", play_beep=True, timeout=60, max_length=120)
+    # If recording doesn't happen, you may branch, but this is simple flow.
     return Response(str(response), mimetype="text/xml")
 
 
-# -----------------------------
-# 2) PROCESS RECORDING
-# -----------------------------
+# =================================================
+# PROCESS RECORDING -> STT -> LLM -> REPLY / FORWARD
+# =================================================
 @app.route("/process-recording", methods=["POST"])
 def process_recording():
     state = load_state()
+    recording_url = request.form.get("RecordingUrl")
+    if not recording_url:
+        # no recording — politely hang up
+        resp = VoiceResponse()
+        resp.say("Sorry, I did not get that. Goodbye.")
+        resp.hangup()
+        return Response(str(resp), mimetype="text/xml")
 
-    recording_url = request.form.get("RecordingUrl") + ".wav"
-
-    # --- Download recording ---
-    audio_file = "caller_audio.wav"
-    data = requests.get(recording_url).content
-    with open(audio_file, "wb") as f:
-        f.write(data)
-
-    # --- Speech to Text ---
-    recognizer = sr.Recognizer()
+    # Twilio gives a recording URL without extension; we request .wav
+    audio_url = recording_url + ".wav"
+    audio_file = "caller.wav"
     try:
-        with sr.AudioFile(audio_file) as source:
-            audio = recognizer.record(source)
-        text = recognizer.recognize_google(audio)
-    except:
-        text = "(voice not clear)"
+        audio_data = requests.get(audio_url, timeout=15).content
+        with open(audio_file, "wb") as f:
+            f.write(audio_data)
+    except Exception as e:
+        print("Failed to download recording:", e)
+        resp = VoiceResponse()
+        resp.say("Sorry, there was an error processing your message.")
+        resp.hangup()
+        return Response(str(resp), mimetype="text/xml")
 
-    urgent = detect_urgent(text)
+    # Speech-to-text (using google via SpeechRecognition wrapper)
+    recognizer = sr.Recognizer()
+    with sr.AudioFile(audio_file) as source:
+        audio = recognizer.record(source)
 
-    response = VoiceResponse()
+    try:
+        caller_text = recognizer.recognize_google(audio)
+    except Exception as e:
+        print("STT error:", e)
+        caller_text = ""
 
-    # If message urgent → forward immediately to user number
-    if urgent and state["user_number"]:
-        response.say("Connecting you to the user right now, please wait.")
+    # Decide urgency
+    urgent = is_urgent(caller_text)
 
-        # Dial user
-        dial = Dial(caller_id=TWILIO_FROM)
-        dial.number(state["user_number"])
-        response.append(dial)
+    # If urgent and we have a user number, forward the call immediately
+    if urgent and state.get("user_number"):
+        resp = VoiceResponse()
+        resp.say("This seems urgent. I will connect you to the user now. Please hold.")
+        d = Dial()
+        d.number(state["user_number"])
+        resp.append(d)
+        return Response(str(resp), mimetype="text/xml")
 
-        return Response(str(response), mimetype="text/xml")
-
-    # NOT URGENT → normal reply
-    reply = llm_reply(text, state["mode"], state["custom_reason"])
-    response.say(reply)
-    response.hangup()
-
-    return Response(str(response), mimetype="text/xml")
-
-
-# -----------------------------
-# 3) LLM RESPONSE
-# -----------------------------
-def llm_reply(user_text, mode, custom_reason):
-    client = Groq(api_key=LLM_API_KEY)
-
-    mode_text = {
-        "sleep": "The user is sleeping.",
-        "meeting": "The user is in a meeting.",
-        "driving": "The user is driving.",
-        "custom": custom_reason
-    }.get(mode, "The user is unavailable.")
-
-    prompt = f"""
-You are a polite AI call agent. 
-Caller said: "{user_text}"
-User mode: {mode_text}
-Give one short human-like sentence.
-Do NOT mention AI or automation.
-"""
-    res = client.chat.completions.create(
-        model="llama3-8b-8192",
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=50
-    )
-
-    return res.choices[0].message["content"]
+    # Not urgent: speak a mode-based reply (short) and hang up
+    reply = mode_reply(state, caller_text)
+    resp = VoiceResponse()
+    resp.say(reply)
+    resp.hangup()
+    return Response(str(resp), mimetype="text/xml")
 
 
-# -----------------------------
-# Run Server
-# -----------------------------
+# =================================================
+# URGENCY DETECTION using Groq or keyword fallback
+# =================================================
+def is_urgent(text):
+    text = (text or "").strip()
+    if not text:
+        return False
+    # Try Groq if API key present
+    if LLM_API_KEY:
+        try:
+            client = Groq(api_key=LLM_API_KEY)
+            prompt = f"Decide if this message is urgent. Reply YES or NO only.\nMessage: \"{text}\""
+            resp = client.chat.completions.create(
+                model="llama3-8b-8192",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=3,
+            )
+            ans = resp.choices[0].message["content"].strip().upper()
+            return "YES" in ans
+        except Exception as e:
+            print("Groq error (falling back):", e)
+
+    # keyword fallback
+    urgent_words = ["urgent", "emergency", "important", "asap", "immediately", "help"]
+    t = text.lower()
+    return any(w in t for w in urgent_words)
+
+
+# =================================================
+# MODE-BASED REPLY (short)
+# =================================================
+def mode_reply(state, text):
+    mode = state.get("mode", "normal")
+    reason = state.get("reason", "") or ""
+
+    if mode == "sleep":
+        return "The user is currently sleeping. I will notify them."
+    if mode == "meeting":
+        return "The user is in a meeting and cannot take calls right now."
+    if mode == "driving":
+        return "The user is driving. I will tell them to call you when safe."
+    if mode == "custom":
+        if reason:
+            return f"The user is not available: {reason}. I will let them know."
+        return "The user is currently unavailable. I will notify them."
+    # normal fallback
+    return "The user is not available right now. They will call you back soon."
+
+# =================================================
+# RUN SERVER
+# =================================================
 if __name__ == "__main__":
-    app.run(port=5000, debug=True)
+    # ensure state file exists
+    load_state()
+    app.run(host="0.0.0.0", port=5000)
